@@ -6,37 +6,24 @@ import xml.etree.ElementTree as ET
 import os
 import time
 
-# ----------------------------------------------------------------------
-# 0. 초기 설정 및 환경 정의
-# ----------------------------------------------------------------------
-
-# 시각화 시 한글 폰트 깨짐 방지 설정 (Malgun Gothic)
-plt.rcParams['font.family'] = 'Malgun Gothic'
-# 마이너스 부호 깨짐 방지
+# 한글 폰트 적용
+plt.rcParams['font.family'] = 'Malgun Gothic'  # 맑은 고딕
 plt.rcParams['axes.unicode_minus'] = False
 
-# Open DART API Key 설정
+# Open DART API Key
 api_key = 'api_key_secret'
 dart.set_api_key(api_key)
 
-# ----------------------------------------------------------------------
-# 1. 기업 코드 및 리스트 수집
-# ----------------------------------------------------------------------
-
-def fetch_dart_corp_code_xml():
-    """
-    DART API를 통해 전체 상장 기업의 기업 코드를 다운로드하여 'corpCode.xml'로 저장함.
-    데이터 수집의 선행 조건.
-    """
+def corpcode_download():
     try:
         url = f"https://opendart.fss.or.kr/api/corpCode.xml"
         params = {
             'crtfc_key': api_key
         }
         resp = requests.get(url, params=params)
-        resp.raise_for_status() # HTTP 오류 발생 시 예외 발생
+        resp.raise_for_status()
 
-        # 응답 내용을 XML 파일로 저장
+        # XML 파일로 저장
         with open("corpCode.xml", "wb") as f:
             f.write(resp.content)
         print("XML 파일 다운로드 완료!")
@@ -45,42 +32,33 @@ def fetch_dart_corp_code_xml():
         print("실패:", e)
 
 
-def process_krx_kospi_list():
-    """
-    KRX 상장법인 목록 CSV를 불러와 KOSPI 시장, 2014년 이전 상장, 12월 결산 법인만을 필터링함.
-    분석 대상 기업 리스트를 정의함.
-    """
+def get_kospi_list():
     file_path = 'data/상장법인목록.csv'
 
-    # KRX CSV 파일 인코딩 ('cp949')으로 읽기
-    df = pd.read_csv(file_path, encoding='cp949')
+    df = pd.read_csv(file_path, encoding='cp949')  # KRX CSV는 대부분 cp949
 
-    # 상장일을 datetime 객체로 변환
+    # 상장일을 datetime으로 변환
     df['상장일'] = pd.to_datetime(df['상장일'], errors='coerce')
 
-    # 분석 대상 기업 조건 필터링: KOSPI ('유가'), 오래된 상장사, 12월 결산
+    # 필터링
     kospi_list = df[
         (df['시장구분'] == '유가') &
         (df['상장일'] <= '2014-01-01') &
         (df['결산월'] == '12월')
     ]
 
+    # 결과 확인
     print(f"조건에 맞는 기업 수: {len(kospi_list)}개")
     
     return kospi_list
 
 
-def process_match_corp_codes(kospi_list):
-    """
-    KRX 리스트의 회사명과 DART 기업 코드 리스트를 매칭하여 최종 분석 대상 기업 코드를 확보함.
-    결과를 'kospi_corps.csv'로 저장함.
-    """
-    # DART 기업 코드 XML 파일 불러오기
-    # XML 파싱 시 data/dart_corp_list.xml 경로 사용을 가정 (다운로드된 파일명과 다를 경우 수정 필요)
+def match_corpcode_krx_to_dart(kospi_list):
+    # XML 파일 불러오기
     tree = ET.parse('data/dart_corp_list.xml')
     root = tree.getroot()
 
-    # XML 리스트를 DataFrame으로 변환
+    # 리스트로 변환
     corp_list = []
     for lst in root.findall('list'):
         corp_list.append({
@@ -89,45 +67,45 @@ def process_match_corp_codes(kospi_list):
             'stock_code': lst.find('stock_code').text,
             'modify_date': lst.find('modify_date').text
         })
+
     dart_df = pd.DataFrame(corp_list)
 
-    # KRX 리스트와 DART 코드를 '회사명' 기준으로 Left Join
+    # CSV에서 필터링한 회사명과 매칭
     kospi_df = kospi_list.merge(dart_df[['corp_name', 'corp_code']],
-                                 left_on='회사명', right_on='corp_name', how='left')
+                                left_on='회사명', right_on='corp_name', how='left')
     kospi_df = kospi_df.rename(columns={'회사명':'corp_name'})
 
-    # DART 코드를 8자리 문자열로 포맷팅 (엑셀 인식 오류 방지)
+    # corp_code를 문자열로 강제 변환, 8자리로 채우기
     kospi_df['corp_code'] = kospi_df['corp_code'].astype(str).str.zfill(8)
+    # Excel에서도 안전하게 문자열로 인식되도록 따옴표 추가
     kospi_df['corp_code'] = kospi_df['corp_code'].apply(lambda x: f'"{x}"')
 
     kospi_df.to_csv('./data/kospi_corps.csv', encoding="utf-8-sig", index=False)
     print('kospi_corps.csv 저장 완료')
+    return kospi_df
 
-# ----------------------------------------------------------------------
-# 2. 고용 현황 데이터 수집 (Raw Data)
-# ----------------------------------------------------------------------
 
-def fetch_employment_raw_data():
-    """
-    선정된 KOSPI 기업들을 대상으로 2016년부터 2024년까지의 직원 현황(empSttus) 정보를 DART API에서 수집함.
-    반기보고서와 사업보고서를 모두 수집하여 시간 경과에 따른 변화를 관찰할 수 있도록 함.
-    """
+def get_emp_raw_data():
     kospi_df = pd.read_csv('./data/kospi_corps.csv', encoding='utf-8-sig')
-    result = []
+    result = []  # 결과 저장 리스트
     
-    # DART 직원현황 API에서 필요한 컬럼 목록
-    needed_cols = [
-        'corp_code', 'corp_name', 'sexdstn', 'fo_bbm', 'rgllbr_co', 
-        'cnttk_co', 'sm', 'fyer_salary_totamt',
+    needed_cols = [ # DART 직원현황에서 가져올 컬럼 정의
+        'corp_code',
+        'corp_name',
+        'sexdstn',
+        'fo_bbm',
+        'rgllbr_co',
+        'cnttk_co',
+        'sm',
+        'fyer_salary_totamt',
     ]
     
     for row in kospi_df.itertuples():
         corp_name = row.corp_name
-        # DART 코드는 따옴표 제거 후 사용
         corp_code = row.corp_code.replace('"','')
+        print(f"\n{corp_name} 데이터 수집 중")
 
         for year in range(2016, 2025):
-            # '11012': 반기보고서, '11011': 사업보고서
             for reprt_code, reprt_name in [('11012', '반기보고서'), ('11011', '사업보고서')]:
 
                 try:
@@ -141,22 +119,25 @@ def fetch_employment_raw_data():
 
                     resp = requests.get(url, params=params)
                     js = resp.json()
-
-                    if js.get('status') == '000':
+                    print(js['status'])
+                    if js['status'] == '000':
                         emp_list = js['list']
                         emp_df = pd.DataFrame(emp_list)
                         
-                        # 필요한 컬럼만 추출 및 보고서 정보 추가
                         emp_df = emp_df[[col for col in needed_cols if col in emp_df.columns]]
+                        # 결과 누적
                         emp_df['연도'] = year
                         emp_df['보고서유형'] = reprt_name
                         
-                        # 컬럼명 한글화 (분석 용이성 확보)
                         emp_df = emp_df.rename(columns={
-                            'corp_code' : '종목코드', 'corp_name' : '기업명',
-                            'sexdstn' : '성별', 'fo_bbm' : '사업부문',
-                            'rgllbr_co' : '정규직', 'cnttk_co' : '계약직',
-                            'sm' : '직원합', 'fyer_salary_totamt' : '총급여'
+                            'corp_code' : '종목코드',
+                            'corp_name' : '기업명',
+                            'sexdstn' : '성별',
+                            'fo_bbm' : '사업부문',
+                            'rgllbr_co' : '정규직',
+                            'cnttk_co' : '계약직',
+                            'sm' : '직원합',
+                            'fyer_salary_totamt' : '총급여'
                         })
                         
                         result.append(emp_df)
@@ -164,11 +145,13 @@ def fetch_employment_raw_data():
                         print(f"데이터 없음: {js.get('message')}")
 
                     print(f"{corp_name} {year}년 {reprt_name} 수집 완료")
-                    time.sleep(0.3) # API 부하 방지 및 제한 회피를 위한 대기
+                    time.sleep(0.3)
 
                 except Exception as e:
                     print(f"{year}년 {reprt_name} 실패: {e}")
                     
+        print(f"진행 상황 : {len(result)} ")
+        
     # 결과 합치기 및 CSV 저장
     os.makedirs('./data', exist_ok=True)
     if result:
@@ -177,21 +160,16 @@ def fetch_employment_raw_data():
         final_df = pd.DataFrame()
     final_df.to_csv('./data/emp_raw.csv', encoding="utf-8-sig", index=False)
     print('emp_raw.csv 저장 완료')
+    return final_df
 
-
-def process_combine_emp_by_corp():
-    """
-    수집된 직원 현황 Raw 데이터를 기업, 연도, 보고서유형, 성별 기준으로 통합하고 숫자형으로 변환함.
-    사업부문별로 분리된 데이터를 통합하여 기업 전체의 합산 데이터를 만듦.
-    """
+def purify_emp_data():
     emp_raw_df = pd.read_csv('./data/emp_raw.csv')
-    
-    # 숫자 타입 변환 및 콤마 제거 처리 (데이터 정제)
+    # 숫자 타입 변환 (혹시 문자열로 되어있을 경우 대비)
     for col in ['정규직', '계약직', '직원합', '총급여']:
         emp_raw_df[col] = emp_raw_df[col].astype(str).str.replace(',', '')
         emp_raw_df[col] = pd.to_numeric(emp_raw_df[col], errors='coerce').fillna(0)
 
-    # 주요 식별자 기준으로 그룹화 후 합산 (사업부문 통합)
+    # 그룹화 및 합산
     emp_df = emp_raw_df.groupby(
         ['기업명', '연도', '보고서유형', '성별'],
         as_index=False
@@ -203,94 +181,104 @@ def process_combine_emp_by_corp():
     
     emp_df.to_csv('./data/emp_combine.csv', encoding="utf-8-sig", index=False)
     print('emp_combine.csv 저장 완료')
-
+    return emp_df
     
-def process_filter_valid_emp_data():
-    """
-    통합된 직원 데이터를 대상으로 2016년부터 2024년까지의 모든 연도별/보고서유형 데이터가 온전히 존재하는 
-    (기업명, 성별) 쌍만을 필터링하여 분석의 일관성을 확보함.
-    """
-    # emp.csv 파일 경로 사용은 오류 가능성이 있으므로, 이전 단계의 emp_combine.csv를 사용하도록 수정 필요
-    emp_df = pd.read_csv('./data/emp_combine.csv') # 가정: emp_combine.csv 사용
+def valid_emp_data():
+    emp_df = pd.read_csv('./data/emp.csv')
     
-    # 기준 연도 및 보고서 유형 정의
+    # 2016~2024년, 반기보고서와 사업보고서가 모두 있는 회사+성별만 남김.
     years = list(range(2016, 2025))
     report_types = ['반기보고서', '사업보고서']
 
-    # 각 그룹별 (연도, 보고서유형) 조합이 모두 존재하는지 확인
+    # 각 회사+성별 그룹별 (연도, 보고서유형) 개수 확인
     grouped = emp_df.groupby(['기업명', '성별'])
     
     valid_idx = []
-    all_pairs = set((y, r) for y in years for r in report_types)
-    
     for (corp, gender), group in grouped:
+        # (연도, 보고서유형) 조합 추출
         pairs = set([tuple(x) for x in group[['연도', '보고서유형']].values])
-        # 전체 연도·보고서유형 조합이 현재 그룹의 부분집합인지 확인
+        # 모든 연도·보고서유형이 존재하면 valid
+        all_pairs = set((y, r) for y in years for r in report_types)
         if all_pairs.issubset(pairs):
             valid_idx.append((corp, gender))
     
-    # 유효한 인덱스만 필터링
+    # 필터링
     valid_emp_df = emp_df.set_index(['기업명', '성별']).loc[valid_idx].reset_index()
     
     valid_emp_df.to_csv('./data/emp_valid.csv', encoding="utf-8-sig", index=False)
     print('emp_valid.csv 저장 완료')
+    
+    return valid_emp_df
 
 
-def process_calculate_emp_metrics():
-    """
-    유효한 직원 데이터를 기반으로 최종 분석에 사용될 파생 변수 및 테이블을 생성함.
-    핵심: 연간 총 급여를 '사업보고서 총 급여'에서 '반기보고서 총 급여'를 차감하여 계산함 (중복 계산 방지).
-    성별 및 정규/계약직 구분을 컬럼으로 피벗(Pivot)하여 최종 테이블을 완성함.
-    """
+def transform_emp_final():
+    import pandas as pd
     df = pd.read_csv('./data/emp_valid.csv')
 
-    # 1. 숫자형 컬럼 변환 (재확인)
+    # ---------------------------
+    # 1. 숫자형 컬럼 변환
+    # ---------------------------
     numeric_cols = ['정규직', '계약직', '총급여']
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-    # 2. 반기/사업 데이터 분리
+    # ---------------------------
+    # 2. 반기/사업 분리
+    # ---------------------------
     semi = df[df['보고서유형'] == '반기보고서']
     annual = df[df['보고서유형'] == '사업보고서']
 
-    # 3. 반기-사업 Merge → 순수 연간 급여 계산
-    # 사업보고서 급여(누적) - 반기보고서 급여(누적) = 하반기 급여 (순수 연간 급여)
+    # ---------------------------
+    # 3. 반기-사업 merge → 순수 연간 급여 계산
+    # ---------------------------
     merged = pd.merge(
-        annual, semi, on=['기업명', '연도', '성별'],
-        suffixes=('_annual', '_semi'), how='left'
+        annual,
+        semi,
+        on=['기업명', '연도', '성별'],
+        suffixes=('_annual', '_semi'),
+        how='left'
     )
 
     merged['순수연간급여'] = merged['총급여_annual'] - merged.get('총급여_semi', 0)
-    # 급여가 음수이거나 0일 경우, 사업보고서의 총 급여를 연간 급여로 간주 (예외 처리)
     merged.loc[merged['순수연간급여'] <= 0, '순수연간급여'] = merged['총급여_annual']
 
-    # 4. 사업보고서 데이터 Pivot (성별/고용 형태를 컬럼으로 변환)
+    # ---------------------------
+    # 4. 사업보고서 pivot
+    # ---------------------------
     pivot_annual = merged.pivot_table(
         index=['기업명', '연도'],
         columns='성별',
         values=['정규직_annual', '계약직_annual', '순수연간급여'],
-        aggfunc='sum', fill_value=0
+        aggfunc='sum',
+        fill_value=0
     )
     pivot_annual.columns = ['_'.join(col).strip() for col in pivot_annual.columns.values]
     pivot_annual = pivot_annual.reset_index()
 
-    # 5. 반기보고서 데이터 Pivot
+    # ---------------------------
+    # 5. 반기보고서 pivot
+    # ---------------------------
     pivot_semi = semi.pivot_table(
         index=['기업명', '연도'],
         columns='성별',
         values=['정규직', '계약직', '총급여'],
-        aggfunc='sum', fill_value=0
+        aggfunc='sum',
+        fill_value=0
     )
     pivot_semi.columns = ['_'.join(col).strip() for col in pivot_semi.columns.values]
     pivot_semi = pivot_semi.reset_index()
 
-    # 6. 사업보고서 테이블 생성 (연간 최종 급여 및 직원 수 계산)
+    # ---------------------------
+    # 6. 사업보고서 계산 테이블 생성
+    # ---------------------------
     annual_rows = []
     for row in pivot_annual.itertuples():
-        #... (남성/여성, 정규/계약직 인원 및 급여 추출)
+        corp, year = row.기업명, row.연도
+
         m_reg = getattr(row, '정규직_annual_남', 0)
         m_con = getattr(row, '계약직_annual_남', 0)
         m_pay = getattr(row, '순수연간급여_남', 0)
+
         f_reg = getattr(row, '정규직_annual_여', 0)
         f_con = getattr(row, '계약직_annual_여', 0)
         f_pay = getattr(row, '순수연간급여_여', 0)
@@ -298,26 +286,36 @@ def process_calculate_emp_metrics():
         tot_reg, tot_con = m_reg + f_reg, m_con + f_con
         tot_pay = m_pay + f_pay
         tot_emp = tot_reg + tot_con
-        # 기업 전체의 평균 급여 계산
         avg_pay = tot_pay / tot_emp if tot_emp > 0 else None
 
         annual_rows.append({
-            '기업명': row.기업명, '연도': row.연도, '보고서유형': '사업보고서',
+            '기업명': corp,
+            '연도': year,
+            '보고서유형': '사업보고서',
             '평균급여': avg_pay,
-            '남성직원수': m_reg + m_con, '여성직원수': f_reg + f_con,
-            '정규직수': tot_reg, '계약직수': tot_con,
-            '남성정규직수': m_reg, '남성계약직수': m_con,
-            '여성정규직수': f_reg, '여성계약직수': f_con,
+            '남성직원수': m_reg + m_con,
+            '여성직원수': f_reg + f_con,
+            '정규직수': tot_reg,
+            '계약직수': tot_con,
+            '남성정규직수': m_reg,
+            '남성계약직수': m_con,
+            '여성정규직수': f_reg,
+            '여성계약직수': f_con,
         })
+
     annual_df = pd.DataFrame(annual_rows)
 
+    # ---------------------------
     # 7. 반기보고서 테이블 생성
+    # ---------------------------
     semi_rows = []
     for row in pivot_semi.itertuples():
-        #... (남성/여성, 정규/계약직 인원 및 급여 추출)
+        corp, year = row.기업명, row.연도
+
         m_reg = getattr(row, '정규직_남', 0)
         m_con = getattr(row, '계약직_남', 0)
         m_pay = getattr(row, '총급여_남', 0)
+
         f_reg = getattr(row, '정규직_여', 0)
         f_con = getattr(row, '계약직_여', 0)
         f_pay = getattr(row, '총급여_여', 0)
@@ -325,24 +323,34 @@ def process_calculate_emp_metrics():
         tot_reg, tot_con = m_reg + f_reg, m_con + f_con
         tot_pay = m_pay + f_pay
         tot_emp = tot_reg + tot_con
-        # 기업 전체의 평균 급여 계산
         avg_pay = tot_pay / tot_emp if tot_emp > 0 else None
 
         semi_rows.append({
-            '기업명': row.기업명, '연도': row.연도, '보고서유형': '반기보고서',
+            '기업명': corp,
+            '연도': year,
+            '보고서유형': '반기보고서',
             '평균급여': avg_pay,
-            '남성직원수': m_reg + m_con, '여성직원수': f_reg + f_con,
-            '정규직수': tot_reg, '계약직수': tot_con,
-            '남성정규직수': m_reg, '남성계약직수': m_con,
-            '여성정규직수': f_reg, '여성계약직수': f_con,
+            '남성직원수': m_reg + m_con,
+            '여성직원수': f_reg + f_con,
+            '정규직수': tot_reg,
+            '계약직수': tot_con,
+            '남성정규직수': m_reg,
+            '남성계약직수': m_con,
+            '여성정규직수': f_reg,
+            '여성계약직수': f_con,
         })
+
     semi_df = pd.DataFrame(semi_rows)
 
-    # 8. 반기 + 사업 데이터 통합
+    # ---------------------------
+    # 8. 반기 + 사업 통합
+    # ---------------------------
     total = pd.concat([semi_df, annual_df])
     total = total.sort_values(['기업명', '연도', '보고서유형']).reset_index(drop=True)
 
-    # 9. 직원 현황 변수들의 증감율 계산
+    # ---------------------------
+    # 9. 증감율 계산
+    # ---------------------------
     rate_cols = [
         '평균급여', '남성직원수', '여성직원수',
         '정규직수', '계약직수',
@@ -351,7 +359,7 @@ def process_calculate_emp_metrics():
     ]
 
     for col in rate_cols:
-        total[col + '증감율'] = np.nan # 초기화
+        total[col + '증감율'] = None
 
     for corp in total['기업명'].unique():
         corp_df = total[total['기업명'] == corp]
@@ -359,23 +367,23 @@ def process_calculate_emp_metrics():
         for year in corp_df['연도'].unique():
             ydf = corp_df[corp_df['연도'] == year]
 
-            # (1) 반기보고서 증감율 = 전년도 사업보고서 대비 증감율
+            # (1) 반기 = 전년도 사업보고서 대비
             h1 = ydf[ydf['보고서유형'] == '반기보고서']
             prev = total[
                 (total['기업명'] == corp) &
                 (total['연도'] == year - 1) &
                 (total['보고서유형'] == '사업보고서')
             ]
-            
+
             if not h1.empty and not prev.empty:
                 h1_idx = h1.index[0]
                 for col in rate_cols:
                     before = prev[col].values[0]
                     after = h1[col].values[0]
                     if pd.notna(before) and before != 0:
-                        total.loc[h1_idx, col + '증감율'] = (after - before) / before
-                        
-            # (2) 사업보고서 증감율 = 같은 연도 반기보고서 대비 증감율
+                        total.loc[h1_idx, col + '증감율'] = (after - before) / before * 100
+
+            # (2) 사업 = 같은 연도 반기보고서 대비
             ann = ydf[ydf['보고서유형'] == '사업보고서']
             if not ann.empty and not h1.empty:
                 ann_idx = ann.index[0]
@@ -383,28 +391,26 @@ def process_calculate_emp_metrics():
                     before = h1[col].values[0]
                     after = ann[col].values[0]
                     if pd.notna(before) and before != 0:
-                        total.loc[ann_idx, col + '증감율'] = (after - before) / before
-    
-    # 10. 최종 저장
+                        total.loc[ann_idx, col + '증감율'] = (after - before) / before * 100
+
+    # ---------------------------
+    # 10. 저장
+    # ---------------------------
     total.to_csv('./data/emp_final.csv', index=False, encoding='utf-8-sig')
     print("emp_final.csv 저장 완료!")
 
-# ----------------------------------------------------------------------
-# 3. 재무 성과 데이터 수집 및 전처리
-# ----------------------------------------------------------------------
+    return total
 
-def fetch_financial_raw_data():
-    """
-    선정된 KOSPI 기업들을 대상으로 2016년부터 2024년까지의 재무제표(fnlttSinglAcnt) 정보를 수집함.
-    주요 항목인 '매출액'과 '영업이익'을 통합재무제표(CFS) 또는 개별재무제표(OFS)에서 추출함.
-    """
+
+def get_financial_raw_data():
     kospi_df = pd.read_csv('./data/kospi_corps.csv', encoding='utf-8-sig')
     kospi_count = len(kospi_df)
-    result = []
+    result = []  # 결과 저장 리스트
     
     for row in kospi_df.itertuples():
         corp_name = row.corp_name
         corp_code = row.corp_code.replace('"','')
+        print(f"\n{corp_name} 데이터 수집 중")
 
         for year in range(2016, 2025):
             for reprt_code, reprt_name in [('11012', '반기보고서'), ('11011', '사업보고서')]:
@@ -412,27 +418,30 @@ def fetch_financial_raw_data():
                 try:
                     url = "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json"
                     params = {
-                        'crtfc_key': api_key, 'corp_code': corp_code,
-                        'bsns_year': year, 'reprt_code': reprt_code
+                        'crtfc_key': api_key,
+                        'corp_code': corp_code,
+                        'bsns_year': year,
+                        'reprt_code': reprt_code
                     }
 
                     resp = requests.get(url, params=params)
                     js = resp.json()
-                    
-                    if js.get('status') == '000':
-                        df = pd.DataFrame(js['list'])
+                    print(js['status'])
+                    if js['status'] == '000':
+                        financial_list = js['list']
+                        df = pd.DataFrame(financial_list)
                         
-                        cfs_df = df[df['fs_div'] == 'CFS'] # 연결재무제표 (우선 사용)
-                        ofs_df = df[df['fs_div'] == 'OFS'] # 개별/별도재무제표
+                        cfs_df = df[df['fs_div'] == 'CFS']
+                        ofs_df = df[df['fs_div'] == 'OFS']
 
                         if not cfs_df.empty:
-                            df = cfs_df
+                            df = cfs_df  # CFS가 있으면 CFS 사용
                         elif not ofs_df.empty:
-                            df = ofs_df
+                            df = ofs_df  # 없으면 OFS 사용
                         else:
+                            print("CFS, OFS 모두 데이터 없음")
                             continue
                         
-                        # 매출액, 영업이익 추출 (반기보고서는 thstrm_add_amount, 사업보고서는 thstrm_amount 사용)
                         if reprt_name == "반기보고서":
                             sales = df[df["account_nm"] == "매출액"]["thstrm_add_amount"]
                             op_profit = df[df["account_nm"].isin(["영업이익", "영업손익"])]["thstrm_add_amount"]
@@ -441,7 +450,9 @@ def fetch_financial_raw_data():
                             op_profit = df[df["account_nm"].isin(["영업이익", "영업손익"])]["thstrm_amount"]
                             
                         result.append({
-                            "기업명": corp_name, "연도": year, "보고서유형": reprt_name,
+                            "기업명": corp_name,
+                            "연도": year,
+                            "보고서유형": reprt_name,
                             "매출액": sales.iloc[0] if not sales.empty else None,
                             "영업이익": op_profit.iloc[0] if not op_profit.empty else None
                         })
@@ -454,65 +465,82 @@ def fetch_financial_raw_data():
                 except Exception as e:
                     print(f"{year}년 {reprt_name} 실패: {e}")
                     
+        print(f"진행 상황 : {len(result)} / {kospi_count}")
+        
     # 결과 합치기 및 CSV 저장
     os.makedirs('./data', exist_ok=True)
     if result:
         final_df = pd.DataFrame(result)
     else:
         final_df = pd.DataFrame()
+        print("Error : 값이 존재하지 않습니다.")
     final_df.to_csv('./data/financial_raw.csv', encoding="utf-8-sig", index=False)
     print('financial_raw.csv 저장 완료')
+    return final_df
 
 
-def process_adjust_financial_half():
-    """
-    Raw 재무 데이터를 기반으로 순수 연간(하반기) 실적을 계산함.
-    사업보고서 실적 = (사업보고서 누적) - (반기보고서 누적)
-    """
+def purify_financial():
+    # 1. raw 파일 불러오기
     df = pd.read_csv('./data/financial_raw.csv', encoding='utf-8-sig')
 
-    # 1. 숫자형 변환 및 콤마 제거
+    # 2. 숫자형 변환 (콤마 제거)
     for col in ['매출액', '영업이익']:
-        df[col] = df[col].astype(str).str.replace(',', '', regex=False)
+        df[col] = (
+            df[col]
+            .astype(str)
+            .str.replace(',', '', regex=False)
+        )
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    # 2. 반기/사업 분리 및 인덱스 설정
-    half = df[df['보고서유형'] == '반기보고서'].set_index(['기업명', '연도'])[['매출액', '영업이익']]
-    annual = df[df['보고서유형'] == '사업보고서'].set_index(['기업명', '연도'])[['매출액', '영업이익']]
+    # 3. 반기/사업 분리
+    half = df[df['보고서유형'] == '반기보고서'] \
+        .set_index(['기업명', '연도'])[['매출액', '영업이익']]
 
-    # 3. 사업보고서 실적 보정 (순수 하반기 실적 계산)
+    annual = df[df['보고서유형'] == '사업보고서'] \
+        .set_index(['기업명', '연도'])[['매출액', '영업이익']]
+
+    # 4. 사업보고서 = 사업보고서 - 반기보고서
     annual_adj = annual - half
     annual_adj = annual_adj.reset_index()
     annual_adj['보고서유형'] = '사업보고서'
 
-    # 4. 반기보고서는 원본 그대로 유지
+    # 5. 반기보고서는 원본 그대로
     half_raw = half.reset_index()
     half_raw['보고서유형'] = '반기보고서'
 
-    # 5. 합치기 및 저장
+    # 6. 합치기
     final = pd.concat([half_raw, annual_adj], ignore_index=True)
+
+    # 7. 정렬
     final = final.sort_values(['기업명', '연도', '보고서유형'])
+
+    # 8. 저장
     final.to_csv('./data/financial_adjust.csv', encoding='utf-8-sig', index=False)
     print('financial_adjust.csv 저장 완료')
 
+    return final
 
-def process_calculate_financial_rates():
-    """
-    보정된 재무 데이터를 사용하여 '매출액증감율' 및 '영업이익증감율'을 계산함.
-    - 반기보고서 증감율: 전년도 사업보고서 대비
-    - 사업보고서 증감율: 같은 연도 반기보고서 대비
-    """
+
+def financial_final():
+    # 1. 불러오기
     df = pd.read_csv('./data/financial_adjust.csv', encoding='utf-8-sig')
 
-    # 숫자 변환 보정 (재확인)
+    # 숫자 변환 보정 (혹시 문자열 섞였을 경우 대비)
     for col in ['매출액', '영업이익']:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
+    # 정렬 (연산 정확도를 위해)
     df = df.sort_values(['기업명', '연도', '보고서유형']).reset_index(drop=True)
+
     results = []
 
+    # 기업 단위로 그룹
     for corp, g in df.groupby('기업명'):
         g = g.sort_values(['연도', '보고서유형'])
+
+        # 보고서 구조는 일반적으로
+        # (전년 사업보고서) → (해당년도 반기보고서) → (해당년도 사업보고서)
+        # 순서를 기대함
 
         for idx, row in g.iterrows():
             year = row['연도']
@@ -520,54 +548,70 @@ def process_calculate_financial_rates():
             sales = row['매출액']
             op = row['영업이익']
 
-            sales_rate, op_rate = None, None
+            sales_rate = None
+            op_rate = None
 
             if report == "반기보고서":
-                # 기준: 전년도 사업보고서
+                # 전년도 사업보고서와 비교
                 prev = g[(g['연도'] == year - 1) & (g['보고서유형'] == '사업보고서')]
+                if not prev.empty:
+                    prev_sales = prev.iloc[0]['매출액']
+                    prev_op = prev.iloc[0]['영업이익']
+
+                    if prev_sales != 0:
+                        sales_rate = (sales - prev_sales) / prev_sales * 100
+                    if prev_op != 0:
+                        op_rate = (op - prev_op) / prev_op * 100
+
             else:  # report == "사업보고서"
-                # 기준: 같은 해 반기보고서
+                # 같은 해 반기보고서와 비교
                 prev = g[(g['연도'] == year) & (g['보고서유형'] == '반기보고서')]
+                if not prev.empty:
+                    prev_sales = prev.iloc[0]['매출액']
+                    prev_op = prev.iloc[0]['영업이익']
 
-            if not prev.empty:
-                prev_sales = prev.iloc[0]['매출액']
-                prev_op = prev.iloc[0]['영업이익']
-
-                # 증감율 계산 ((현재 - 이전) / 이전)
-                if prev_sales != 0:
-                    sales_rate = (sales - prev_sales) / prev_sales
-                if prev_op != 0:
-                    op_rate = (op - prev_op) / prev_op
+                    if prev_sales != 0:
+                        sales_rate = (sales - prev_sales) / prev_sales * 100
+                    if prev_op != 0:
+                        op_rate = (op - prev_op) / prev_op * 100
 
             results.append({
-                '기업명': corp, '연도': year, '보고서유형': report,
-                '매출액': sales, '영업이익': op,
-                '매출액증감율': sales_rate, '영업이익증감율': op_rate
+                '기업명': corp,
+                '연도': year,
+                '보고서유형': report,
+                '매출액': sales,
+                '영업이익': op,
+                '매출액증감율': sales_rate,
+                '영업이익증감율': op_rate
             })
 
+    # DataFrame 생성
     final = pd.DataFrame(results)
+
+    # 저장
     final.to_csv('./data/financial_final.csv', encoding='utf-8-sig', index=False)
     print("financial_final.csv 저장 완료!")
 
-# ----------------------------------------------------------------------
-# 4. 최종 데이터 통합 및 정제
-# ----------------------------------------------------------------------
+    return final
 
-def finalize_merge_data():
-    """
-    직원 현황 최종 데이터(emp_final.csv)와 재무 성과 최종 데이터(financial_final.csv)를 
-    '기업명', '연도', '보고서유형'을 기준으로 Left Join하여 통합 분석 데이터셋을 생성함.
-    """
+
+def merge_emp_financial():
+    import pandas as pd
+
     emp = pd.read_csv('./data/emp_final.csv')
     fin = pd.read_csv('./data/financial_final.csv')
 
-    # 재무 변수 숫자 변환 재확인
+    # 문자열 숫자에서 콤마 제거 후 숫자 변환
     for col in ['매출액', '영업이익']:
         if col in fin.columns:
-            fin[col] = fin[col].astype(str).str.replace(',', '', regex=False)
+            fin[col] = (
+                fin[col]
+                .astype(str)
+                .str.replace(',', '', regex=False)
+            )
             fin[col] = pd.to_numeric(fin[col], errors='coerce').fillna(0)
 
-    # 병합 수행
+    # 병합
     merged = pd.merge(
         emp,
         fin[['기업명', '연도', '보고서유형', '매출액', '매출액증감율', '영업이익', '영업이익증감율']],
@@ -575,63 +619,63 @@ def finalize_merge_data():
         how='left'
     )
 
-    # 결측치 0으로 처리 (재무 지표)
     merged['매출액'] = merged['매출액'].fillna(0)
     merged['영업이익'] = merged['영업이익'].fillna(0)
 
     merged.to_csv('./data/emp_financial_merged.csv', encoding='utf-8-sig', index=False)
     print("emp_financial_merged.csv 저장 완료!")
 
+    return merged
 
-def finalize_clean_and_save():
-    """
-    통합 데이터셋에서 분석의 신뢰도를 저해하는 이상치 기업(매출액/영업이익이 0인 기록이 존재하는 기업)을 제거함.
-    최종 분석 데이터셋인 'final_emp_financial.csv'를 생성함.
-    """
+
+def final_emp_financial():
+    # 1. 파일 읽기
     df = pd.read_csv('./data/emp_financial_merged.csv', encoding='utf-8-sig')
 
-    # 숫자형 변환 (재확인)
+    # 숫자형 변환 (혹시 문자열이 섞여있을 경우 대비)
     for col in ['매출액', '영업이익']:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-    # 2016 반기보고서 제거 (전년도 데이터가 없어 증감율 계산 불가)
+    # 2. 2016 반기보고서 제거
     df = df[~((df['연도'] == 2016) & (df['보고서유형'] == '반기보고서'))]
 
-    # 매출액 및 영업이익이 0인 기록이 있는 기업 필터링
+    # 3. 2017~2024에서 매출=0 AND 영업이익=0 인 기업 찾기
     zero_problem = (
         df[(df['연도'] >= 2017) & (df['연도'] <= 2024)]
         .groupby('기업명')
         .apply(lambda x: ((x['매출액'] == 0) & (x['영업이익'] == 0)).any())
     )
 
+    # 문제 기업 리스트
     bad_corps = zero_problem[zero_problem].index.tolist()
-    print("매출·영업이익 모두 0인 해가 존재하는 기업 수:", len(bad_corps))
 
-    # 문제 기업 전체 데이터 제거
+    print("매출·영업이익 모두 0인 해가 존재하는 기업 수:", len(bad_corps))
+    print("기업 목록:", bad_corps)
+
+    # 4. 문제 기업 전체 데이터 제거 (2016~2024 전체 삭제)
     df_clean = df[~df['기업명'].isin(bad_corps)]
 
-    # 최종 저장 (모든 NaN을 0으로 처리)
+    # 5. 저장
     df_clean = df_clean.fillna(0)
     df_clean.to_csv('./data/final_emp_financial.csv', encoding='utf-8-sig', index=False)
     print("final_emp_financial.csv 저장 완료!")
 
+    return df_clean
+
+
 
 if __name__ == '__main__':
+    # kospi_list = get_kospi_list()
+    # kospi_df = match_corpcode_krx_to_dart(kospi_list)
     
-    # --- 데이터 수집 및 전처리 실행 순서 ---
+    # emp_raw_df = get_emp_raw_data()
+    # purify_emp_data()
+    # valid_emp_data()
+    transform_emp_final()
     
-    fetch_dart_corp_code_xml()            # 1. DART 기업 코드 XML 다운로드
-    kospi_list = process_krx_kospi_list()  # 2. KRX 리스트 필터링
-    process_match_corp_codes(kospi_list) # 3. KRX-DART 코드 매칭
+    # get_financial_raw_data()
+    # purify_financial()
+    # financial_final()
     
-    fetch_employment_raw_data() # 4. 직원 현황 Raw 데이터 수집
-    process_combine_emp_by_corp()              # 5. 직원 데이터 사업부문 통합
-    process_filter_valid_emp_data()               # 6. 데이터가 온전한 기업 필터링
-    process_calculate_emp_metrics()            # 7. 직원 데이터 최종 파생 변수 및 증감율 계산
-    
-    fetch_financial_raw_data()       # 8. 재무 데이터 Raw 수집
-    process_adjust_financial_half()             # 9. 재무 데이터 순수 연간(하반기) 실적 보정
-    process_calculate_financial_rates()              # 10. 재무 데이터 증감율 계산
-    
-    finalize_merge_data()            # 11. 고용-재무 데이터 통합
-    finalize_clean_and_save()            # 12. 최종 데이터 정제 및 저장
+    merge_emp_financial()
+    final_emp_financial()
