@@ -11,7 +11,7 @@ plt.rcParams['font.family'] = 'Malgun Gothic'  # 맑은 고딕
 plt.rcParams['axes.unicode_minus'] = False
 
 # Open DART API Key
-api_key = 'ff5d4bff214441585f355c4297775e3fdb09259b'
+api_key = 'api_key_secret'
 dart.set_api_key(api_key)
 
 def corpcode_download():
@@ -381,7 +381,7 @@ def transform_emp_final():
                     before = prev[col].values[0]
                     after = h1[col].values[0]
                     if pd.notna(before) and before != 0:
-                        total.loc[h1_idx, col + '증감율'] = (after - before) / before
+                        total.loc[h1_idx, col + '증감율'] = (after - before) / before * 100
 
             # (2) 사업 = 같은 연도 반기보고서 대비
             ann = ydf[ydf['보고서유형'] == '사업보고서']
@@ -391,7 +391,7 @@ def transform_emp_final():
                     before = h1[col].values[0]
                     after = ann[col].values[0]
                     if pd.notna(before) and before != 0:
-                        total.loc[ann_idx, col + '증감율'] = (after - before) / before
+                        total.loc[ann_idx, col + '증감율'] = (after - before) / before * 100
 
     # ---------------------------
     # 10. 저장
@@ -656,6 +656,7 @@ def final_emp_financial():
     df_clean = df[~df['기업명'].isin(bad_corps)]
 
     # 5. 저장
+    df_clean = df_clean.fillna(0)
     df_clean.to_csv('./data/final_emp_financial.csv', encoding='utf-8-sig', index=False)
     print("final_emp_financial.csv 저장 완료!")
 
@@ -670,11 +671,11 @@ if __name__ == '__main__':
     # emp_raw_df = get_emp_raw_data()
     # purify_emp_data()
     # valid_emp_data()
-    # transform_emp_final()
+    transform_emp_final()
     
     # get_financial_raw_data()
     # purify_financial()
     # financial_final()
     
-    # merge_emp_financial()
+    merge_emp_financial()
     final_emp_financial()
